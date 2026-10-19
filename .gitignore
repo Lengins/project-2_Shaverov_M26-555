@@ -2,4 +2,6 @@
  dist/
  __pycache__/
  *.egg-info
+data/
+db_meta.json
  
