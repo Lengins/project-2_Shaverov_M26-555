@@ -2,38 +2,42 @@
 
 from typing import Any
 
+from primitive_db.decorators import confirm_action, handle_db_errors, log_time
 from primitive_db.utils import load_table_data
 
 VALID_TYPES = {"int", "str", "bool"}
 
 
-# ---------- Метаданные (из прошлого задания, без изменений) ----------
+# ---------- Метаданные ----------
 
+@handle_db_errors
 def create_table(
     metadata: dict[str, Any],
     table_name: str,
     columns: list[tuple[str, str]],
-) -> dict[str, Any] | None:
+) -> dict[str, Any]:
     if table_name in metadata:
-        print(f'Ошибка: Таблица "{table_name}" уже существует.')
-        return None
+        raise ValueError(f'таблица "{table_name}" уже существует')
+
     for _, col_type in columns:
         if col_type not in VALID_TYPES:
-            print(f"Некорректное значение: {col_type}. Попробуйте снова.")
-            return None
+            raise ValueError(
+                f'недопустимый тип "{col_type}" (допустимо: {", ".join(sorted(VALID_TYPES))})' # noqa: E501
+            )
+
     full_columns = [{"name": "ID", "type": "int"}]
     full_columns.extend({"name": n, "type": t} for n, t in columns)
     metadata[table_name] = {"columns": full_columns}
+
     cols_repr = ", ".join(f"{c['name']}:{c['type']}" for c in full_columns)
     print(f'Таблица "{table_name}" успешно создана со столбцами: {cols_repr}')
     return metadata
 
 
-def drop_table(metadata: dict[str, Any], table_name: str) -> dict[str, Any] | None:
-    if table_name not in metadata:
-        print(f'Ошибка: Таблица "{table_name}" не существует.')
-        return None
-    del metadata[table_name]
+@handle_db_errors
+@confirm_action("удаление таблицы")
+def drop_table(metadata: dict[str, Any], table_name: str) -> dict[str, Any]:
+    del metadata[table_name]  # KeyError, если таблицы нет
     print(f'Таблица "{table_name}" успешно удалена.')
     return metadata
 
@@ -49,61 +53,50 @@ def list_tables(metadata: dict[str, Any]) -> None:
 # ---------- CRUD ----------
 
 def _convert_value(raw: str, target_type: str) -> Any:
-    """'28' -> int(28), '"Sergei"' -> 'Sergei', 'true' -> True."""
+    """'28' -> 28, '\"Sergei\"' -> 'Sergei', 'true' -> True. Бросает ValueError."""
     raw = raw.strip()
     if target_type == "int":
         try:
             return int(raw)
         except ValueError:
-            raise ValueError(raw)
+            raise ValueError(f'некорректное значение "{raw}" для типа int')
     if target_type == "bool":
         low = raw.lower()
         if low == "true":
             return True
         if low == "false":
             return False
-        raise ValueError(raw)
+        raise ValueError(f'некорректное значение "{raw}" для типа bool (ожидается true/false)') # noqa: E501
     if target_type == "str":
         if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ('"', "'"):
             return raw[1:-1]
-        raise ValueError(raw)
-    raise ValueError(f"Неизвестный тип: {target_type}")
+        raise ValueError(f'строковое значение должно быть в кавычках: {raw}')
+    raise ValueError(f"неизвестный тип: {target_type}")
 
 
 def _row_matches(row: dict, where_clause: dict) -> bool:
     return all(row.get(k) == v for k, v in where_clause.items())
 
 
+@handle_db_errors
+@log_time
 def insert(
     metadata: dict[str, Any],
     table_name: str,
     raw_values: list[str],
-) -> list[dict] | None:
-    """Вставляет запись. ID генерируется. Возвращает данные или None при ошибке."""
-    if table_name not in metadata:
-        print(f'Ошибка: Таблица "{table_name}" не существует.')
-        return None
-
-    columns = metadata[table_name]["columns"]
-    data_columns = columns[1:]  # без ID
+) -> list[dict]:
+    columns = metadata[table_name]["columns"]  # KeyError, если таблицы нет
+    data_columns = columns[1:]
 
     if len(raw_values) != len(data_columns):
-        print(
-            f'Ошибка: Таблица "{table_name}" ожидает {len(data_columns)} '
-            f"значений (без ID), получено {len(raw_values)}."
+        raise ValueError(
+            f'таблица "{table_name}" ожидает {len(data_columns)} значений (без ID), '
+            f"получено {len(raw_values)}"
         )
-        return None
 
     record: dict[str, Any] = {}
     for raw, col in zip(raw_values, data_columns):
-        try:
-            record[col["name"]] = _convert_value(raw, col["type"])
-        except ValueError:
-            print(
-                f'Ошибка: Некорректное значение "{raw}" '
-                f'для столбца "{col["name"]}" ({col["type"]}).'
-            )
-            return None
+        record[col["name"]] = _convert_value(raw, col["type"])
 
     table_data = load_table_data(table_name)
     new_id = max((r["ID"] for r in table_data), default=0) + 1
@@ -115,6 +108,7 @@ def insert(
     return table_data
 
 
+@log_time
 def select(
     table_data: list[dict],
     where_clause: dict | None = None,
@@ -124,12 +118,12 @@ def select(
     return [row for row in table_data if _row_matches(row, where_clause)]
 
 
+@handle_db_errors
 def update(
     table_data: list[dict],
     set_clause: dict,
     where_clause: dict,
 ) -> tuple[list[dict], list[int]]:
-    """Возвращает (data, affected_ids)."""
     affected: list[int] = []
     for row in table_data:
         if _row_matches(row, where_clause):
@@ -138,11 +132,12 @@ def update(
     return table_data, affected
 
 
+@handle_db_errors
+@confirm_action("удаление записей")
 def delete(
     table_data: list[dict],
     where_clause: dict,
 ) -> tuple[list[dict], list[int]]:
-    """Возвращает (data, deleted_ids)."""
     kept: list[dict] = []
     deleted: list[int] = []
     for row in table_data:

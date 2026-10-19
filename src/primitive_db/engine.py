@@ -15,6 +15,7 @@ from primitive_db.core import (
     select,
     update,
 )
+from primitive_db.decorators import create_cacher
 from primitive_db.utils import (
     delete_table_data,
     load_metadata,
@@ -24,6 +25,9 @@ from primitive_db.utils import (
 )
 
 DEFAULT_DB_PATH = "db_meta.json"
+
+# Кэш результатов select (per-process)
+_select_cacher = create_cacher()
 
 INSERT_RE = re.compile(
     r"^insert\s+into\s+(\w+)\s+values\s*\(\s*(.*?)\s*\)\s*$",
@@ -63,10 +67,22 @@ def _print_commands_block() -> None:
     print("<command> list_tables - показать список всех таблиц")
     print("<command> drop_table <имя_таблицы> - удалить таблицу")
     print("<command> info <имя_таблицы> - информация о таблице")
-    print("<command> insert into <имя_таблицы> values (<зн1>, <зн2>, ...) - добавить запись") # noqa: E501
-    print("<command> select from <имя_таблицы> [where <столбец> = <значение>] - прочитать") # noqa: E501
-    print("<command> update <имя_таблицы> set <столбец> = <значение> where <условие> - обновить") # noqa: E501
-    print("<command> delete from <имя_таблицы> where <столбец> = <значение> - удалить")
+    print(
+        "<command> insert into <имя_таблицы> values (<зн1>, <зн2>, ...) "
+        "- добавить запись"
+    )
+    print(
+        "<command> select from <имя_таблицы> [where <столбец> = <значение>] "
+        "- прочитать"
+    )
+    print(
+        "<command> update <имя_таблицы> set <столбец> = <значение> "
+        "where <условие> - обновить"
+    )
+    print(
+        "<command> delete from <имя_таблицы> where <столбец> = <значение> "
+        "- удалить"
+    )
     print()
     print("Общие команды:")
     print("<command> exit - выход из программы")
@@ -161,6 +177,7 @@ def _handle_drop(rest: list[str], db_path: str) -> None:
     if result is not None:
         save_metadata(db_path, result)
         delete_table_data(table_name)
+        _select_cacher.clear()
 
 
 def _handle_info(rest: list[str], db_path: str) -> None:
@@ -187,6 +204,7 @@ def _handle_insert(m: re.Match, db_path: str) -> None:
     result = insert(metadata, table_name, raw_values)
     if result is not None:
         save_table_data(table_name, result)
+        _select_cacher.clear()
 
 
 def _handle_select(m: re.Match, db_path: str) -> None:
@@ -207,9 +225,15 @@ def _handle_select(m: re.Match, db_path: str) -> None:
             print(f"Некорректное значение: {exc}. Попробуйте снова.")
             return
 
-    data = load_table_data(table_name)
-    result = select(data, where_clause)
-    _print_table(result, metadata[table_name]["columns"])
+    def fetch() -> list[dict]:
+        return select(load_table_data(table_name), where_clause)
+
+    key = (
+        table_name,
+        tuple(sorted(where_clause.items())) if where_clause else None,
+    )
+    data = _select_cacher(key, fetch)
+    _print_table(data, metadata[table_name]["columns"])
 
 
 def _handle_update(m: re.Match, db_path: str) -> None:
@@ -230,8 +254,12 @@ def _handle_update(m: re.Match, db_path: str) -> None:
         return
 
     data = load_table_data(table_name)
-    data, affected = update(data, set_clause, where_clause)
+    result = update(data, set_clause, where_clause)
+    if result is None:
+        return  # декоратор уже напечатал ошибку
+    data, affected = result
     save_table_data(table_name, data)
+    _select_cacher.clear()
 
     if not affected:
         print("Нет записей, подходящих под условие.")
@@ -255,8 +283,12 @@ def _handle_delete(m: re.Match, db_path: str) -> None:
         return
 
     data = load_table_data(table_name)
-    data, deleted = delete(data, where_clause)
+    result = delete(data, where_clause)
+    if result is None:
+        return  # либо отменили, либо ошибка — декоратор уже сообщил
+    data, deleted = result
     save_table_data(table_name, data)
+    _select_cacher.clear()
 
     if not deleted:
         print("Нет записей, подходящих под условие.")
